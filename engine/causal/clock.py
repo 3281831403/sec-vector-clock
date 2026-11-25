@@ -26,8 +26,7 @@ non-kept node into the summary instead of discarding it, and :func:`merge`,
 The four comparison outcomes are exact lowercase strings: ``"before"``,
 ``"after"``, ``"equal"`` and ``"concurrent"``.  No tolerance, rounding or
 heuristic is permitted anywhere.  All functions are deterministic, use only
-the standard library, never mutate their arguments, and currently raise
-``NotImplementedError`` until the defects are fixed.
+the standard library, never mutate their arguments, and never mutate their arguments.
 
 Validation problem codes are returned in lexicographic order:
 
@@ -44,11 +43,49 @@ Validation problem codes are returned in lexicographic order:
     in the summary.
 """
 
+from collections.abc import Mapping
+
 SUMMARY_KEY = "__summary__"
 BEFORE = "before"
 AFTER = "after"
 EQUAL = "equal"
 CONCURRENT = "concurrent"
+
+
+def _is_count(value) -> bool:
+    """Return ``True`` for a legitimate non-negative integer count.
+
+    ``bool`` subclasses ``int`` but is not a legitimate counter value.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _count_problems(value, prefix: str, label: str) -> list[str]:
+    """Return the problem codes for one counter ``value``."""
+    if not _is_count(value):
+        return [f"{prefix}count:not-int:{label}"]
+    if value < 0:
+        return [f"{prefix}count:negative:{label}"]
+    return []
+
+
+def _flatten(clock: dict) -> dict:
+    """Return a flat copy of ``clock``, expanding its summary, or raise.
+
+    A malformed clock raises ``ValueError``.  Explicit zeros are preserved so
+    that merges keep every component that either side spells out.
+    """
+    problems = validate_clock(clock)
+    if problems:
+        raise ValueError("malformed clock: " + ", ".join(problems))
+    flat = {}
+    for node, count in clock.items():
+        if node == SUMMARY_KEY:
+            continue
+        flat[node] = count
+    if SUMMARY_KEY in clock:
+        flat.update(clock[SUMMARY_KEY])
+    return flat
 
 
 def tick(clock: dict, node: str) -> dict:
@@ -64,10 +101,14 @@ def tick(clock: dict, node: str) -> dict:
     The input is not modified.  Malformed clocks, including a sparse summary
     in this function, raise ``ValueError``.  A missing node starts at zero and
     therefore becomes one.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    if not isinstance(node, str) or not node:
+        raise ValueError("node must be a non-empty string")
+    if isinstance(clock, Mapping) and SUMMARY_KEY in clock:
+        raise ValueError("tick expects a flat clock, got a sparse summary")
+    flat = _flatten(clock)
+    flat[node] = flat.get(node, 0) + 1
+    return flat
 
 
 def merge(a: dict, b: dict) -> dict:
@@ -83,10 +124,13 @@ def merge(a: dict, b: dict) -> dict:
     The result never contains the reserved summary key: it is a fully expanded
     clock.  Neither argument is modified.  A malformed clock raises
     ``ValueError``.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    left = _flatten(a)
+    right = _flatten(b)
+    merged = {}
+    for node in left.keys() | right.keys():
+        merged[node] = max(left.get(node, 0), right.get(node, 0))
+    return merged
 
 
 def compare(a: dict, b: dict) -> str:
@@ -111,10 +155,25 @@ def compare(a: dict, b: dict) -> str:
     An absent component and an explicit zero are identical.  A node absent
     from both clocks cannot create a causal relation.  Neither argument is
     modified.  A malformed clock raises ``ValueError``.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    left = _flatten(a)
+    right = _flatten(b)
+    a_ahead = False
+    b_ahead = False
+    for node in left.keys() | right.keys():
+        left_count = left.get(node, 0)
+        right_count = right.get(node, 0)
+        if left_count > right_count:
+            a_ahead = True
+        elif left_count < right_count:
+            b_ahead = True
+    if a_ahead and b_ahead:
+        return CONCURRENT
+    if a_ahead:
+        return AFTER
+    if b_ahead:
+        return BEFORE
+    return EQUAL
 
 
 def happens_before(a: dict, b: dict) -> bool:
@@ -129,10 +188,8 @@ def happens_before(a: dict, b: dict) -> bool:
     Missing and explicit zero components are equivalent, and a missing node
     does not count as a causal difference.  The arguments are not modified.
     A malformed clock raises ``ValueError``.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    return compare(a, b) == BEFORE
 
 
 def concurrent(a: dict, b: dict) -> bool:
@@ -148,10 +205,19 @@ def concurrent(a: dict, b: dict) -> bool:
     is not concurrent with it.  Missing and explicit zero components are
     equivalent.  The arguments are not modified.  A malformed clock raises
     ``ValueError``.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    left = _flatten(a)
+    right = _flatten(b)
+    a_ahead = False
+    b_ahead = False
+    for node in left.keys() | right.keys():
+        left_count = left.get(node, 0)
+        right_count = right.get(node, 0)
+        if left_count > right_count:
+            a_ahead = True
+        elif left_count < right_count:
+            b_ahead = True
+    return a_ahead and b_ahead
 
 
 def compact(clock: dict, keep) -> dict:
@@ -170,10 +236,24 @@ def compact(clock: dict, keep) -> dict:
     is raised; :func:`validate_clock` reports the same condition as
     ``summary:conflict:<node>``.  The reserved key itself may not appear in
     ``keep``.  The input and ``keep`` are not modified.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    if isinstance(keep, str):
+        raise ValueError("keep must be an iterable of node names, not a string")
+    try:
+        kept_nodes = list(keep)
+    except TypeError as exc:
+        raise ValueError("keep must be an iterable of node names") from exc
+    for node in kept_nodes:
+        if not isinstance(node, str) or not node:
+            raise ValueError("kept node names must be non-empty strings")
+        if node == SUMMARY_KEY:
+            raise ValueError(f"reserved key {SUMMARY_KEY!r} may not be kept")
+    flat = _flatten(clock)
+    kept_set = set(kept_nodes)
+    folded = {node: count for node, count in flat.items() if node not in kept_set}
+    compacted = {node: flat.get(node, 0) for node in kept_nodes}
+    compacted[SUMMARY_KEY] = folded
+    return compacted
 
 
 def validate_clock(clock: dict) -> list[str]:
@@ -190,10 +270,36 @@ def validate_clock(clock: dict) -> list[str]:
     clock and a clean sparse clock both return ``[]``.  The input is not
     modified and this function does not raise for structural damage; it
     reports every problem it can find.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    if not isinstance(clock, Mapping):
+        return ["clock:not-dict"]
+    problems = []
+    summary = None
+    if SUMMARY_KEY in clock:
+        summary = clock[SUMMARY_KEY]
+        if not isinstance(summary, Mapping):
+            problems.append("summary:not-dict")
+            summary = None
+    for node, count in clock.items():
+        if node == SUMMARY_KEY:
+            continue
+        if not isinstance(node, str):
+            problems.append("node:not-str")
+        elif not node:
+            problems.append("node:empty")
+        label = node if isinstance(node, str) else str(node)
+        problems.extend(_count_problems(count, "", label))
+    if summary is not None:
+        for node, count in summary.items():
+            if not isinstance(node, str):
+                problems.append("summary:node:not-str")
+            elif not node:
+                problems.append("summary:node:empty")
+            label = node if isinstance(node, str) else str(node)
+            problems.extend(_count_problems(count, "summary:", label))
+            if isinstance(node, str) and node in clock and node != SUMMARY_KEY:
+                problems.append(f"summary:conflict:{node}")
+    return sorted(set(problems))
 
 
 def clock_batch(events: list, policy: dict) -> dict:
@@ -218,7 +324,26 @@ def clock_batch(events: list, policy: dict) -> dict:
 
     The input events and policy are not modified.  Malformed events, nodes or
     policies raise ``ValueError``.
-
-    Raises ``NotImplementedError`` until implemented.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping) or "merge_results" not in policy:
+        raise ValueError("policy must be a mapping with 'merge_results'")
+    merge_results = policy["merge_results"]
+    if not isinstance(merge_results, bool):
+        raise ValueError("policy['merge_results'] must be a boolean")
+    if not isinstance(events, list):
+        raise ValueError("events must be a list")
+    results = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise ValueError("each event must be a mapping")
+        if "clock" not in event or "node" not in event:
+            raise ValueError("each event needs 'clock' and 'node'")
+        start = event["clock"]
+        if isinstance(start, Mapping) and SUMMARY_KEY in start:
+            start = _flatten(start)
+        results.append(tick(start, event["node"]))
+    merged = {}
+    if merge_results:
+        for result in results:
+            merged = merge(merged, result)
+    return {"results": results, "merged": merged}
